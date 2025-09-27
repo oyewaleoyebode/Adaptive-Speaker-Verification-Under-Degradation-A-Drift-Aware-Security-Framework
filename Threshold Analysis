@@ -1,0 +1,195 @@
+#Threshold Analysis Through threshold Sweep To analyze security vs accessibility tradeoff
+
+import os
+import torch
+import numpy as np
+import torchaudio
+import pandas as pd
+from tqdm import tqdm
+from collections import defaultdict
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+from speechbrain.inference import EncoderClassifier
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import entropy
+
+# === Device & Threshold ===
+device = torch.device("cpu")
+fixed_threshold = 0.7
+
+# === Load Models ===
+model_name = "openai/whisper-large-v3"
+processor = AutoProcessor.from_pretrained(model_name)
+whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
+classifier = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="tmp").to(device)
+whisper_model.eval()
+classifier.mods.eval()
+
+# === Paths ===
+degradation_levels = {
+    "Baseline": "/work/oluwatobi-o/VOICE_DEGRADATION/16kh_Converted_VoiceInput copy",
+    "Level 2": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_2_Output_fixed",
+    "Level 3": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_3_Output_fixed_WAV",
+    "Level 4": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_4_Output_WAV",
+    "Level 5": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_5_Output_WAV"
+}
+embedding_output_directory = "/work/oluwatobi-o/Speaker_Identification/Combined_Speakers_embeddings"
+
+# === Extract Combined Embedding ===
+def extract_combined_embeddings(audio_path):
+    try:
+        waveform, sr = torchaudio.load(audio_path)
+        waveform = waveform.to(device)
+        if sr != 16000:
+            waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(waveform)
+        waveform = waveform.squeeze()
+
+        inputs = processor(waveform.cpu().numpy(), sampling_rate=16000, return_tensors="pt").to(device)
+        decoder_input_ids = torch.zeros((inputs["input_features"].shape[0], 1), dtype=torch.long).to(device)
+
+        with torch.no_grad():
+            output = whisper_model(**inputs, decoder_input_ids=decoder_input_ids, output_hidden_states=True)
+        whisper_emb = output.encoder_hidden_states[-2].mean(dim=1).squeeze()
+        whisper_emb = whisper_emb / torch.norm(whisper_emb)
+
+        waveform = waveform.unsqueeze(0)
+        with torch.no_grad():
+            ecapa_emb = classifier.encode_batch(waveform).squeeze()
+        ecapa_emb = ecapa_emb / torch.norm(ecapa_emb)
+
+        return torch.cat((whisper_emb, ecapa_emb)).cpu().numpy()
+    except Exception as e:
+        print(f"❌ Error processing {audio_path}: {e}")
+        return None
+
+# === Load All Reference Embeddings (One-to-Many) ===
+print("🔍 Loading all reference embeddings...")
+reference_embeddings = []
+for speaker_folder in tqdm(os.listdir(embedding_output_directory)):
+    speaker_path = os.path.join(embedding_output_directory, speaker_folder)
+    if os.path.isdir(speaker_path):
+        for file in os.listdir(speaker_path):
+            if file.endswith(".npy"):
+                emb = np.load(os.path.join(speaker_path, file))
+                emb /= np.linalg.norm(emb)
+                reference_embeddings.append((speaker_folder.lower(), emb))
+print(f"✅ Loaded {len(reference_embeddings)} individual reference embeddings")
+
+# === Metrics Storage ===
+results = {
+    "Level": [], "Mean Similarity": [], "Similarity Drift": [], "Std Dev": [],
+    "Entropy": [], "Top-1": [], "Top-3": [], "Verified": [], "Rejected": [],
+    "Accuracy (%)": [], "Samples": []
+}
+spread_scores = defaultdict(list)
+
+# === Main Evaluation ===
+for level, test_path in degradation_levels.items():
+    print(f"\n🎯 Evaluating Deviation at: {level}")
+    mean_sim, drift, stds, entropies = [], [], [], []
+    top1_hits, top3_hits, verified, rejected, total = 0, 0, 0, 0, 0
+
+    for speaker_folder in tqdm(os.listdir(test_path)):
+        speaker_path = os.path.join(test_path, speaker_folder)
+        if not os.path.isdir(speaker_path): continue
+        test_files = sorted([f for f in os.listdir(speaker_path) if f.endswith(".wav")])[:1]
+
+        for f in test_files:
+            total += 1
+            emb = extract_combined_embeddings(os.path.join(speaker_path, f))
+            if emb is None: continue
+
+            sims = [(ref_speaker, cosine_similarity([emb], [ref_emb])[0][0]) for ref_speaker, ref_emb in reference_embeddings]
+            sims.sort(key=lambda x: x[1], reverse=True)
+            sim_vals = [s[1] for s in sims]
+            ref_names = [s[0] for s in sims]
+
+            # ✅ Use top-1 similarity only
+            mean_sim.append(sim_vals[0])
+            drift.append(1 - sim_vals[0])
+            stds.append(np.std(sim_vals))
+            entropies.append(entropy(sim_vals))
+            spread_scores[level].extend(sim_vals)
+
+            speaker_lower = speaker_folder.lower()
+            if ref_names[0] == speaker_lower:
+                top1_hits += 1
+            if speaker_lower in ref_names[:3]:
+                top3_hits += 1
+            if sim_vals[0] >= fixed_threshold and ref_names[0] == speaker_lower:
+                verified += 1
+            else:
+                rejected += 1
+
+    if total == 0:
+        continue
+
+    results["Level"].append(level)
+    results["Mean Similarity"].append(np.mean(mean_sim))
+    results["Similarity Drift"].append(np.mean(drift))
+    results["Std Dev"].append(np.mean(stds))
+    results["Entropy"].append(np.mean(entropies))
+    results["Top-1"].append(round(top1_hits / total * 100, 2))
+    results["Top-3"].append(round(top3_hits / total * 100, 2))
+    results["Verified"].append(verified)
+    results["Rejected"].append(rejected)
+    results["Accuracy (%)"].append(round(verified / total * 100, 2))
+    results["Samples"].append(total)
+
+# === Show Table ===
+df = pd.DataFrame(results).set_index("Level")
+print("\n📊 Final Deviation Results (One-to-Many, Top-1 Similarity):")
+print(df)
+
+# === Visualization ===
+plt.figure(figsize=(18, 5))
+
+plt.subplot(1, 3, 1)
+plt.plot(df.index, df["Accuracy (%)"], marker='o')
+plt.title("Accuracy Across Degradation")
+plt.ylabel("Accuracy (%)")
+plt.grid(True)
+
+plt.subplot(1, 3, 2)
+sns.boxplot(data=[spread_scores[k] for k in df.index])
+plt.xticks(ticks=range(len(df.index)), labels=df.index)
+plt.title("Cosine Similarity Spread")
+
+plt.subplot(1, 3, 3)
+sns.heatmap(df[["Mean Similarity", "Similarity Drift"]].T, annot=True, cmap="YlGnBu", fmt=".2f")
+plt.title("Heatmap: Mean Similarity & Drift")
+
+plt.tight_layout()
+plt.show()
+
+
+# === Temporal Analysis & Adaptive Mapping ===
+temporal_adaptive_response = {
+    "Level": [],
+    "Mean Similarity": [],
+    "Degradation Status": [],
+    "Adaptive Action": []
+}
+
+for i, level in enumerate(results["Level"]):
+    mean_sim = results["Mean Similarity"][i]
+
+    if mean_sim >= 0.66:
+        degradation = "Low"
+        action = "🟢 Recalibrate Threshold (e.g., 0.70 → 0.68)"
+    elif 0.50 <= mean_sim < 0.66:
+        degradation = "Medium"
+        action = "🟠 Activate Liveness Detection"
+    else:
+        degradation = "High"
+        action = "🔴 Trigger MFA & Anomaly Flagging"
+
+    temporal_adaptive_response["Level"].append(level)
+    temporal_adaptive_response["Mean Similarity"].append(round(mean_sim, 4))
+    temporal_adaptive_response["Degradation Status"].append(degradation)
+    temporal_adaptive_response["Adaptive Action"].append(action)
+
+df_temporal = pd.DataFrame(temporal_adaptive_response)
+print("\n🧠 Temporal Adaptive Mapping Summary:")
+print(df_temporal.to_string(index=False))
