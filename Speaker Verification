@@ -1,0 +1,121 @@
+#VERIFICATION USING MULTIPLE SPEAKERS
+
+import os
+import torch
+import numpy as np
+import torchaudio
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+from speechbrain.inference import EncoderClassifier
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
+
+# === Device Setup ===
+device = torch.device("cpu")
+print(f"🖥️ Using device: {device}")
+
+# === Load Models ===
+model_name = "openai/whisper-large-v3"
+processor = AutoProcessor.from_pretrained(model_name)
+whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
+classifier = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="tmp")
+classifier.mods.eval().to(device)
+
+# === Paths ===
+embedding_output_directory = "/work/oluwatobi-o/Speaker_Identification/Combined_Speakers_embeddings"
+test_audio_directory = "/work/oluwatobi-o/VOICE_DEGRADATION/16kh_Converted_VoiceInput copy"
+
+# === Embedding Extraction Functions ===
+def extract_whisper_embedding(audio_path, layer_index=-2):
+    try:
+        waveform, sr = torchaudio.load(audio_path)
+        if sr != 16000:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+            waveform = resampler(waveform)
+        waveform = waveform.squeeze().cpu().numpy()
+        inputs = processor(waveform, sampling_rate=16000, return_tensors="pt")
+
+        decoder_inputs_embeds = torch.randn(
+            inputs["input_features"].shape[0],
+            inputs["input_features"].shape[1],
+            whisper_model.config.d_model
+        )
+
+        with torch.no_grad():
+            outputs = whisper_model(
+                **inputs,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                output_hidden_states=True
+            )
+        return outputs.encoder_hidden_states[layer_index].mean(dim=1).squeeze().cpu().numpy()
+
+    except Exception as e:
+        print(f"⚠️ Error extracting Whisper embedding from {audio_path}: {e}")
+        return None
+
+def extract_ecapa_embedding(audio_path):
+    try:
+        waveform, sr = torchaudio.load(audio_path)
+        if sr != 16000:
+            waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(waveform)
+        waveform = waveform.squeeze().unsqueeze(0)
+        waveform = waveform / waveform.abs().max()
+
+        with torch.no_grad():
+            embedding = classifier.encode_batch(waveform)
+            return embedding.squeeze().cpu().numpy()
+
+    except Exception as e:
+        print(f"⚠️ Error extracting ECAPA embedding from {audio_path}: {e}")
+        return None
+
+def extract_combined_embeddings(audio_path):
+    whisper = extract_whisper_embedding(audio_path)
+    ecapa = extract_ecapa_embedding(audio_path)
+    if whisper is None or ecapa is None:
+        return None
+    whisper = whisper / np.linalg.norm(whisper)
+    ecapa = ecapa / np.linalg.norm(ecapa)
+    return np.concatenate((whisper, ecapa))
+
+# === Load Stored Embeddings ===
+stored_embeddings = {}
+speaker_folders = os.listdir(embedding_output_directory)
+print("🔍 Loading stored embeddings...")
+for speaker_folder in tqdm(speaker_folders, desc="Loading embeddings"):
+    folder_path = os.path.join(embedding_output_directory, speaker_folder)
+    if os.path.isdir(folder_path):
+        for file in os.listdir(folder_path):
+            if file.endswith(".npy"):
+                path = os.path.join(folder_path, file)
+                stored_embeddings[path] = (speaker_folder, np.load(path))
+
+# === Identification: Check if speaker can identify themselves ===
+print("\n🔎 Starting speaker identification...")
+test_speaker_folders = os.listdir(test_audio_directory)
+
+for speaker_folder in tqdm(test_speaker_folders, desc="Checking speakers"):
+    speaker_path = os.path.join(test_audio_directory, speaker_folder)
+    if not os.path.isdir(speaker_path): continue
+    test_files = sorted([f for f in os.listdir(speaker_path) if f.endswith(".wav")])[:1]
+
+    for file in test_files:
+        test_audio_path = os.path.join(speaker_path, file)
+        test_embedding = extract_combined_embeddings(test_audio_path)
+        if test_embedding is None:
+            print(f"❌ Skipping {file} (failed to extract embedding)")
+            continue
+
+        # Compare with all stored embeddings
+        max_similarity = 0
+        predicted_speaker = None
+
+        for _, (ref_speaker, ref_embedding) in stored_embeddings.items():
+            sim = cosine_similarity([test_embedding], [ref_embedding])[0][0]
+            if sim > max_similarity:
+                max_similarity = sim
+                predicted_speaker = ref_speaker
+
+        if predicted_speaker == speaker_folder:
+            print(f"✅ {speaker_folder}/{file} successfully identified as {predicted_speaker} (cosine: {max_similarity:.4f})")
+        else:
+            print(f"❌ {speaker_folder}/{file} identified as {predicted_speaker} instead (cosine: {max_similarity:.4f})")
