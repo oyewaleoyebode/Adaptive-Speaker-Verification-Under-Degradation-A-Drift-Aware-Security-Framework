@@ -1,0 +1,33 @@
+#mapping banking-standard actions → to the existing DriftStatus
+
+import pandas as pd
+
+# === Load your current 4.2 results ===
+drift_csv = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/drift_detection_results.csv"
+df = pd.read_csv(drift_csv)
+
+# === Add AttemptNumber column (default 1st attempt) ===
+df['AttemptNumber'] = 1  # first attempt
+
+# === Define final banking-standard procedure mapping ===
+def map_final_procedure(row):
+    if row['DriftStatus'] == 'No Drift':
+        return '✅ Accept'
+    elif row['DriftStatus'] == 'Mild Drift':
+        if row['AttemptNumber'] == 1:
+            return '🟠 Prompt Repeat (Active Challenge)'
+        else:
+            return '🔴 MFA (Fallback after failed repeat)'
+    elif row['DriftStatus'] == 'High Drift':
+        return '🔴 MFA (High Drift Immediate)'
+    else:
+        return 'Unknown'
+
+# === Apply the mapping ===
+df['FinalSecurityProcedure'] = df.apply(map_final_procedure, axis=1)
+
+# === Save refined 4.2 results ===
+output_csv = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/drift_detection_results_with_procedure.csv"
+df.to_csv(output_csv, index=False)
+
+print(f"✅ Refined 4.2 results saved to:\n{output_csv}")
