@@ -1,0 +1,58 @@
+#Periodic Recalibration for Long-Term Robustness
+
+import pandas as pd
+import numpy as np
+
+# === Load Drift Detection Results ===
+csv_path = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/drift_detection_results.csv"
+df = pd.read_csv(csv_path)
+
+# === Step 1: Simulate Time Progression ===
+df = df.copy()
+df['TimeIndex'] = np.arange(len(df))
+
+# === Step 2: Simulate Periodic Recalibration Every N Samples ===
+N = 50  # Recalibrate every 50 inputs
+initial_threshold = 0.04
+thresholds = []
+
+for i in range(len(df)):
+    # Recalibrate every N samples
+    if i % N == 0 and i != 0:
+        # Simulate drift threshold adjustment (e.g., slight tightening)
+        current_threshold = max(0.02, initial_threshold - 0.005 * (i // N))
+    else:
+        current_threshold = thresholds[-1] if thresholds else initial_threshold
+
+    thresholds.append(current_threshold)
+
+df['AdjustedThreshold'] = thresholds
+
+# === Step 3: Recalculate Drift Status with Updated Thresholds ===
+def classify_drift(row):
+    if row['Deviation'] >= row['AdjustedThreshold']:
+        return 'High Drift'
+    elif row['Deviation'] >= (row['AdjustedThreshold'] / 2):
+        return 'Mild Drift'
+    else:
+        return 'No Drift'
+
+df['RecalibratedDrift'] = df.apply(classify_drift, axis=1)
+
+# === Step 4: Compare Drift Label Changes Before vs After ===
+df['DriftChanged'] = df['DriftStatus'] != df['RecalibratedDrift']
+drift_change_rate = 100 * df['DriftChanged'].sum() / len(df)
+
+# === Step 5: Summary Table ===
+summary = df.groupby('RecalibratedDrift').size().reset_index(name='Count')
+summary['Percent'] = 100 * summary['Count'] / summary['Count'].sum()
+
+# === Save Recalibrated Output ===
+df.to_csv("/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/recalibrated_drift_results.csv", index=False)
+summary.to_csv("/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/recalibrated_drift_summary.csv", index=False)
+
+# === Print Results ===
+print("✅ Recalibration simulation complete.")
+print(f"🔁 Drift Label Change Rate: {drift_change_rate:.2f}%")
+print("\n=== Recalibrated Drift Summary ===")
+print(summary)
