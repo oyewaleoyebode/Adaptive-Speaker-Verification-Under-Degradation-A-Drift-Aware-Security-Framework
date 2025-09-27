@@ -1,0 +1,165 @@
+#Dynamic Security Adaptation
+
+import os
+import torch
+import numpy as np
+import torchaudio
+from tqdm import tqdm
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+from speechbrain.inference import EncoderClassifier
+
+# === Device Setup ===
+device = torch.device("cpu")
+
+# === Model Loading ===
+whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained("openai/whisper-large-v3").to(device)
+whisper_processor = AutoProcessor.from_pretrained("openai/whisper-large-v3")
+ecapa_model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="tmp_spkrec").to(device)
+
+whisper_model.eval()
+ecapa_model.mods.eval()
+
+# === Directories ===
+embedding_output_directory = "/work/oluwatobi-o/Speaker_Identification/Combined_Speakers_embeddings"
+baseline_path = "/work/oluwatobi-o/VOICE_DEGRADATION/16kh_Converted_VoiceInput copy"
+degradation_levels = {
+    "Level 2": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_2_Output_fixed",
+    "Level 3": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_3_Output_fixed_WAV",
+    "Level 4": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_4_Output_WAV",
+    "Level 5": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_5_Output_WAV"
+}
+
+# === Load Stored Reference Embeddings ===
+stored_embeddings = {}
+for speaker_folder in os.listdir(embedding_output_directory):
+    spk_path = os.path.join(embedding_output_directory, speaker_folder)
+    if os.path.isdir(spk_path):
+        embeddings = []
+        for file in os.listdir(spk_path):
+            if file.endswith(".npy"):
+                path = os.path.join(spk_path, file)
+                embeddings.append(np.load(path))
+        stored_embeddings[speaker_folder] = embeddings
+
+# === Embedding Extraction ===
+def extract_combined_embedding(audio_path):
+    waveform, sr = torchaudio.load(audio_path)
+    if sr != 16000:
+        waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(waveform)
+    waveform = waveform.squeeze()
+
+    # Whisper
+    inputs = whisper_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
+    decoder_inputs_embeds = torch.randn(
+        inputs["input_features"].shape[0],
+        inputs["input_features"].shape[1],
+        whisper_model.config.d_model
+    )
+    with torch.no_grad():
+        whisper_out = whisper_model(
+            **inputs,
+            decoder_inputs_embeds=decoder_inputs_embeds,
+            output_hidden_states=True
+        )
+    whisper_emb = whisper_out.encoder_hidden_states[-2].mean(dim=1).squeeze().cpu().numpy()
+
+    # ECAPA
+    waveform_norm = waveform / waveform.abs().max()
+    with torch.no_grad():
+        ecapa_emb = ecapa_model.encode_batch(waveform_norm.unsqueeze(0)).squeeze().cpu().numpy()
+
+    # Combine
+    whisper_emb = whisper_emb / np.linalg.norm(whisper_emb)
+    ecapa_emb = ecapa_emb / np.linalg.norm(ecapa_emb)
+    return np.concatenate((whisper_emb, ecapa_emb))
+
+# === Drift Detection Function ===
+def detect_drift(baseline, current):
+    deviation = abs(current - baseline)
+    if deviation < 0.02:
+        return deviation, "No Drift"
+    elif deviation < 0.04:
+        return deviation, "Mild Drift"
+    else:
+        return deviation, "High Drift"
+
+# === Step 1: Compute Baseline Similarities ===
+baseline_similarity = {}
+print("\n📊 Calculating baseline similarities...")
+for speaker_id in tqdm(os.listdir(baseline_path), desc="Baseline"):
+    speaker_dir = os.path.join(baseline_path, speaker_id)
+    if not os.path.isdir(speaker_dir):
+        continue
+    wav_files = [f for f in os.listdir(speaker_dir) if f.endswith(".wav")]
+    if not wav_files:
+        continue
+
+    test_path = os.path.join(speaker_dir, wav_files[0])
+    try:
+        test_embedding = extract_combined_embedding(test_path)
+    except Exception as e:
+        print(f"❌ Failed to extract baseline for {speaker_id}: {e}")
+        continue
+
+    max_sim = -1
+    for ref_emb in stored_embeddings.get(speaker_id, []):
+        sim = cosine_similarity(test_embedding.reshape(1, -1), ref_emb.reshape(1, -1))[0][0]
+        max_sim = max(max_sim, sim)
+
+    if max_sim > 0:
+        baseline_similarity[speaker_id] = max_sim
+
+# === Step 2: Evaluate Degradation Levels ===
+print("\n📉 Evaluating degraded levels...")
+for level_name, level_path in degradation_levels.items():
+    print(f"\n🎧 Evaluating: {level_name}")
+    if not os.path.isdir(level_path):
+        print(f"⚠️ Path not found: {level_path}")
+        continue
+
+    speakers = [s for s in os.listdir(level_path) if os.path.isdir(os.path.join(level_path, s))]
+    for speaker_id in tqdm(speakers, desc=f"Testing {level_name}"):
+        speaker_dir = os.path.join(level_path, speaker_id)
+        test_files = [f for f in os.listdir(speaker_dir) if f.endswith(".wav")]
+        if not test_files:
+            continue
+
+        audio_path = os.path.join(speaker_dir, test_files[0])
+        try:
+            test_embedding = extract_combined_embedding(audio_path)
+        except Exception as e:
+            print(f"❌ Failed to process {audio_path}: {e}")
+            continue
+
+        # Match to stored embeddings
+        max_sim = -1
+        matched_speaker = None
+        for ref_id, ref_embs in stored_embeddings.items():
+            for ref_emb in ref_embs:
+                sim = cosine_similarity(test_embedding.reshape(1, -1), ref_emb.reshape(1, -1))[0][0]
+                if sim > max_sim:
+                    max_sim = sim
+                    matched_speaker = ref_id
+
+        # Drift Detection
+        if matched_speaker in baseline_similarity:
+            baseline_sim = baseline_similarity[matched_speaker]
+            deviation, drift_status = detect_drift(baseline_sim, max_sim)
+
+            if drift_status == "No Drift":
+                action = "✅ Accept"
+            elif drift_status == "Mild Drift":
+                action = "🟠 Trigger Liveness Check"
+            else:
+                action = "🔴 Require MFA or Block"
+
+            print(f"\n🔍 Audio: {test_files[0]} | Speaker: {speaker_id}")
+            print(f"Matched Speaker:     {matched_speaker}")
+            print(f"Baseline Similarity: {baseline_sim:.4f}")
+            print(f"Current Similarity:  {max_sim:.4f}")
+            print(f"Deviation:           {deviation:.4f}")
+            print(f"Drift Status:        {drift_status}")
+            print(f"Security Action:     {action}")
+        else:
+            print(f"⚠️ No baseline found for speaker {matched_speaker}")
