@@ -1,0 +1,8 @@
+%pip install torchaudio
+%pip install transformers
+%pip install speechbrain
+%pip install python_speech_features
+%pip install srmrpy
+%pip install tqdm
+%pip install pandas
+%pip install scikit-learn
