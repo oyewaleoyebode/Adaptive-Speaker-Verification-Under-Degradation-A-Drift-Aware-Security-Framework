@@ -1,0 +1,125 @@
+#Real-Time Testing Script
+
+import os
+import torch
+import numpy as np
+import torchaudio
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq, Wav2Vec2ForSequenceClassification
+from speechbrain.inference import EncoderClassifier
+from python_speech_features import mfcc
+from sklearn.metrics.pairwise import cosine_similarity
+
+# === Config ===
+device = torch.device("cpu")
+SIMILARITY_THRESHOLD = 0.7
+embedding_path = "/work/oluwatobi-o/Speaker_Identification/Combined_Speakers_embeddings"
+degradation_model_path = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/wav2vec2_degradation_predictor"
+whisper_model_name = "openai/whisper-large-v3"
+
+# === Load Models ===
+print("🔄 Loading models...")
+processor = AutoProcessor.from_pretrained(whisper_model_name)
+whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(whisper_model_name).to(device)
+classifier = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="tmp").to(device)
+deg_processor = AutoProcessor.from_pretrained(degradation_model_path)
+deg_model = Wav2Vec2ForSequenceClassification.from_pretrained(degradation_model_path).to(device)
+whisper_model.eval(); classifier.mods.eval(); deg_model.eval()
+
+# === Utilities ===
+def compute_snr(waveform):
+    signal_power = waveform.pow(2).mean().item()
+    noise_power = max(1e-10, waveform.var().item() - signal_power)
+    return 10 * np.log10(signal_power / noise_power) if noise_power > 0 else 0
+
+def compute_mfcc_var(waveform, sr):
+    mfcc_feat = mfcc(waveform.numpy(), samplerate=sr, numcep=13)
+    return np.mean(np.std(mfcc_feat, axis=0))
+
+def get_security_action(level):
+    return {
+        0: "🟢 Low → Accept",
+        1: "🟢 Mild → Adjust Threshold",
+        2: "🟠 Medium → Trigger Liveness",
+        3: "🔴 High → Require MFA",
+        4: "🔴 Severe → Block or Alert"
+    }.get(level, "Unknown")
+
+def categorize_risk(score):
+    if score < 0.3: return "Low"
+    elif score < 0.6: return "Medium"
+    else: return "High"
+
+def extract_embeddings(audio_path):
+    waveform, sr = torchaudio.load(audio_path)
+    if sr != 16000:
+        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+    waveform = waveform.squeeze()
+
+    snr = compute_snr(waveform)
+    mfcc_val = compute_mfcc_var(waveform, 16000)
+
+    # ECAPA
+    ecapa_input = waveform.unsqueeze(0).to(device)
+    with torch.no_grad():
+        ecapa = classifier.encode_batch(ecapa_input).squeeze().cpu().numpy()
+    ecapa /= np.linalg.norm(ecapa)
+
+    # Whisper
+    inputs = processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = whisper_model(**inputs, decoder_input_ids=torch.zeros((1,1),dtype=torch.long).to(device), output_hidden_states=True)
+    whisper = out.encoder_hidden_states[-2].mean(dim=1).squeeze().cpu().numpy()
+    whisper /= np.linalg.norm(whisper)
+
+    combined = np.concatenate((ecapa, whisper))
+
+    # Predict Degradation
+    deg_inputs = deg_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
+    with torch.no_grad():
+        logits = deg_model(**deg_inputs).logits
+    predicted_level = torch.argmax(logits, dim=-1).item()
+
+    return combined, snr, mfcc_val, predicted_level
+
+# === Load Reference Embeddings ===
+def load_references():
+    print("📂 Loading reference embeddings...")
+    ref_embeds = []
+    for speaker in os.listdir(embedding_path):
+        speaker_dir = os.path.join(embedding_path, speaker)
+        if not os.path.isdir(speaker_dir): continue
+        for file in os.listdir(speaker_dir):
+            if file.endswith(".npy"):
+                emb = np.load(os.path.join(speaker_dir, file))
+                emb = emb / np.linalg.norm(emb)
+                ref_embeds.append((speaker.lower(), emb))
+    return ref_embeds
+
+# === Run Test ===
+def run_verification(audio_path):
+    print(f"\n🎙️ Evaluating: {audio_path}")
+    ref_embeds = load_references()
+    emb, snr, mfcc_val, pred_level = extract_embeddings(audio_path)
+
+    best_score = 0
+    best_speaker = ""
+    for spk, ref in ref_embeds:
+        score = cosine_similarity([emb], [ref])[0][0]
+        if score > best_score:
+            best_score = score
+            best_speaker = spk
+
+    verified = int(best_score >= SIMILARITY_THRESHOLD)
+    risk_score = round(1 - best_score, 4)
+    risk_label = categorize_risk(risk_score)
+    action = get_security_action(pred_level)
+
+    print(f"🎯 Predicted Level: {pred_level}")
+    print(f"🎧 SNR: {snr:.2f} dB | MFCC: {mfcc_val:.2f}")
+    print(f"🧠 Best Match: {best_speaker} (score: {best_score:.4f})")
+    print(f"✅ Verified: {'YES' if verified else 'NO'}")
+    print(f"🔒 Risk: {risk_label} | Action: {action}")
+
+# === Example ===
+# run_verification("/path/to/test_audio.wav")
+run_verification("/work/oluwatobi-o/VOICE_DEGRADATION/16kh_Converted_VoiceInput copy/speaker_1/audio_1.wav")
