@@ -1,0 +1,247 @@
+# Running the predictive in full code
+
+import os
+import torch
+import numpy as np
+import torchaudio
+import pandas as pd
+from tqdm import tqdm
+from python_speech_features import mfcc
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq, Wav2Vec2ForSequenceClassification
+from speechbrain.inference import EncoderClassifier
+from sklearn.metrics.pairwise import cosine_similarity
+
+# === Device Setup ===
+device = torch.device("cpu")
+print(f"🖥️ Using device: {device}")
+
+# === Load Models ===
+print("🔍 Loading models...")
+model_name = "openai/whisper-large-v3"
+processor = AutoProcessor.from_pretrained(model_name)
+whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
+
+classifier = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb", savedir="tmp_spkrec"
+).to(device)
+
+wav2vec_path = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/wav2vec2_degradation_predictor"
+wav2vec_processor = AutoProcessor.from_pretrained(wav2vec_path)
+wav2vec_model = Wav2Vec2ForSequenceClassification.from_pretrained(wav2vec_path).to(device)
+
+whisper_model.eval()
+classifier.mods.eval()
+wav2vec_model.eval()
+
+# === Paths ===
+embedding_output_directory = "/work/oluwatobi-o/Speaker_Identification/Combined_Speakers_embeddings"
+output_csv_path = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/performance_plus_predictive_alllevels_result.csv"
+
+# === Degradation Levels ===
+degradation_levels = {
+    "Baseline": "/work/oluwatobi-o/VOICE_DEGRADATION/16kh_Converted_VoiceInput copy",
+    "Level 2": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_2_Output_fixed",
+    "Level 3": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_3_Output_fixed_WAV",
+    "Level 4": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_4_Output_WAV",
+    "Level 5": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_5_Output_WAV"
+}
+
+# === Threshold ===
+SIMILARITY_THRESHOLD = 0.7
+
+# === Feature Extraction Functions ===
+def compute_snr(waveform):
+    signal_power = waveform.pow(2).mean().item()
+    noise_power = max(1e-10, waveform.var().item() - signal_power)
+    return 10 * np.log10(signal_power / noise_power) if noise_power > 0 else 0
+
+def compute_mfcc_variability(waveform, sr):
+    mfcc_feat = mfcc(waveform.numpy(), samplerate=sr, numcep=13)
+    return np.mean(np.std(mfcc_feat, axis=0))
+
+# === Embedding Extraction Functions ===
+def extract_whisper_embedding(audio_path, layer_index=-2):
+    try:
+        waveform, sr = torchaudio.load(audio_path)
+        if sr != 16000:
+            waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(waveform)
+        waveform = waveform.squeeze().cpu().numpy()
+
+        inputs = processor(waveform, sampling_rate=16000, return_tensors="pt")
+        decoder_inputs_embeds = torch.randn(
+            inputs["input_features"].shape[0],
+            inputs["input_features"].shape[1],
+            whisper_model.config.d_model
+        )
+
+        with torch.no_grad():
+            outputs = whisper_model(
+                **inputs,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                output_hidden_states=True
+            )
+        return outputs.encoder_hidden_states[layer_index].mean(dim=1).squeeze().cpu().numpy()
+
+    except Exception as e:
+        print(f"⚠️ Error extracting Whisper embedding from {audio_path}: {e}")
+        return None
+
+def extract_ecapa_embedding(audio_path):
+    try:
+        waveform, sr = torchaudio.load(audio_path)
+        if sr != 16000:
+            waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(waveform)
+        waveform = waveform.squeeze().unsqueeze(0)
+        waveform = waveform / waveform.abs().max()
+
+        with torch.no_grad():
+            embedding = classifier.encode_batch(waveform)
+            return embedding.squeeze().cpu().numpy()
+
+    except Exception as e:
+        print(f"⚠️ Error extracting ECAPA embedding from {audio_path}: {e}")
+        return None
+
+def predict_degradation(audio_path):
+    waveform, sr = torchaudio.load(audio_path)
+    if sr != 16000:
+        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+    waveform = waveform.squeeze()
+
+    inputs = wav2vec_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
+    with torch.no_grad():
+        logits = wav2vec_model(**inputs).logits
+    predicted_level = torch.argmax(logits, dim=-1).item()
+    return predicted_level
+
+def categorize_risk(risk_score):
+    if risk_score < 0.3:
+        return "Low"
+    elif risk_score < 0.6:
+        return "Medium"
+    else:
+        return "High"
+
+def get_security_action(predicted_level):
+    return {
+        0: "🟢 Low → Accept",
+        1: "🟢 Mild → Adjust Threshold",
+        2: "🟠 Medium → Trigger Liveness",
+        3: "🔴 High → Require MFA",
+        4: "🔴 Severe → Block or Alert"
+    }.get(predicted_level, "Unknown")
+
+# === Load Stored Embeddings ===
+stored_embeddings = {}
+print("🔍 Loading stored embeddings...")
+for speaker_folder in tqdm(os.listdir(embedding_output_directory), desc="Loading embeddings"):
+    folder_path = os.path.join(embedding_output_directory, speaker_folder)
+    if os.path.isdir(folder_path):
+        for file in os.listdir(folder_path):
+            if file.endswith(".npy"):
+                path = os.path.join(folder_path, file)
+                stored_embeddings[path] = (speaker_folder, np.load(path))
+
+# === Summary Counters ===
+correct_verifications = 0
+wrongly_accepted = 0
+rejected = 0
+failed_extractions = 0
+total_attempts = 0
+
+# === Results Storage ===
+records = []
+
+# === Identification Across All Levels ===
+print("\n🔎 Starting full-level speaker identification (Baseline + Levels 2–5)...")
+for level_name, level_path in degradation_levels.items():
+    print(f"\n🛠️ Processing {level_name}...")
+    if not os.path.isdir(level_path):
+        print(f"⚠️ Level path {level_path} not found, skipping.")
+        continue
+
+    # === Instead of hardcoding speaker_1 to speaker_6, load ALL speakers dynamically ===
+    selected_speakers = sorted([d for d in os.listdir(level_path) if os.path.isdir(os.path.join(level_path, d))])
+
+    for speaker_folder in tqdm(selected_speakers, desc=f"Checking {level_name} speakers"):
+        speaker_path = os.path.join(level_path, speaker_folder)
+        if not os.path.isdir(speaker_path):
+            continue
+        test_files = sorted([f for f in os.listdir(speaker_path) if f.endswith(".wav")])[:1]
+
+        for file in test_files:
+            total_attempts += 1
+            test_audio_path = os.path.join(speaker_path, file)
+
+            waveform, sr = torchaudio.load(test_audio_path)
+            if sr != 16000:
+                waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(waveform)
+            waveform = waveform.squeeze()
+
+            # Feature Extraction
+            snr = compute_snr(waveform)
+            mfcc_var = compute_mfcc_variability(waveform, 16000)
+
+            whisper_emb = extract_whisper_embedding(test_audio_path)
+            ecapa_emb = extract_ecapa_embedding(test_audio_path)
+            predicted_deg = predict_degradation(test_audio_path)
+
+            if whisper_emb is None or ecapa_emb is None:
+                print(f"❌ Skipping {file} (failed to extract embedding)")
+                failed_extractions += 1
+                continue
+
+            whisper_emb = whisper_emb / np.linalg.norm(whisper_emb)
+            ecapa_emb = ecapa_emb / np.linalg.norm(ecapa_emb)
+            combined_emb = np.concatenate((whisper_emb, ecapa_emb))
+
+            # Compare with all stored embeddings
+            max_similarity = 0
+            predicted_speaker = None
+
+            for _, (ref_speaker, ref_embedding) in stored_embeddings.items():
+                sim = cosine_similarity([combined_emb], [ref_embedding])[0][0]
+                if sim > max_similarity:
+                    max_similarity = sim
+                    predicted_speaker = ref_speaker
+
+            # === Verification Logic ===
+            if max_similarity >= SIMILARITY_THRESHOLD and predicted_speaker == speaker_folder:
+                print(f"✅ VERIFIED: {speaker_folder}/{file} (cosine: {max_similarity:.4f})")
+                verified = 1
+                correct_verifications += 1
+            else:
+                if max_similarity >= SIMILARITY_THRESHOLD:
+                    print(f"❌ MISIDENTIFIED: {speaker_folder}/{file} → {predicted_speaker} (cosine: {max_similarity:.4f})")
+                    wrongly_accepted += 1
+                else:
+                    print(f"⛔ REJECTED: {speaker_folder}/{file} (cosine: {max_similarity:.4f} < threshold {SIMILARITY_THRESHOLD})")
+                    rejected += 1
+                verified = 0
+
+            # === Security Scores ===
+            risk_score = round(1 - max_similarity, 4)
+            risk_label = categorize_risk(risk_score)
+            security_action = get_security_action(predicted_deg)
+
+            # Save Record
+            records.append([
+                level_name, speaker_folder, file, snr, mfcc_var, max_similarity, verified,
+                predicted_deg, risk_score, risk_label, security_action
+            ])
+
+
+
+# === Final Summary ===
+print("\n📊 Full-Level Verification + Degradation + Security Summary:")
+print(f"✅ Verified Correctly: {correct_verifications}/{total_attempts} ({(correct_verifications/total_attempts)*100:.1f}%)")
+print(f"❌ Wrongly Accepted: {wrongly_accepted}/{total_attempts}")
+print(f"⛔ Rejected: {rejected}/{total_attempts}")
+print(f"💔 Failed Extractions: {failed_extractions}/{total_attempts}")
+
+# === Save Results ===
+columns = ["Level", "Speaker", "AudioFile", "SNR", "MFCC", "Similarity", "Verified",
+           "PredictedDegLabel", "RiskScore", "RiskLabel", "SecurityAction"]
+df_result = pd.DataFrame(records, columns=columns)
+df_result.to_csv(output_csv_path, index=False)
+print(f"\n✅ Results saved to: {output_csv_path}")
