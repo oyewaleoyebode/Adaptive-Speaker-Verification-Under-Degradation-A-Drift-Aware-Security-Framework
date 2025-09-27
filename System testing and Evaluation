@@ -1,0 +1,143 @@
+# System Testing and Evaluation
+
+import os
+import torch
+import numpy as np
+import torchaudio
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq, Wav2Vec2ForSequenceClassification
+from speechbrain.inference import EncoderClassifier
+
+# === Setup ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# === Paths ===
+test_audio_path = "/work/oluwatobi-o/VOICE_DEGRADATION/Test_Input/test_audio.wav"
+reference_embeddings_dir = "/work/oluwatobi-o/Speaker_Identification/Combined_Speakers_embeddings"
+baseline_clean_audio_dir = "/work/oluwatobi-o/VOICE_DEGRADATION/16kh_Converted_VoiceInput copy"
+wav2vec_path = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/wav2vec2_degradation_predictor"
+
+# === Load Models ===
+print("🔧 Loading models...")
+whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained("openai/whisper-large-v3").to(device).eval()
+whisper_processor = AutoProcessor.from_pretrained("openai/whisper-large-v3")
+ecapa_model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="tmp_spkrec").to(device).eval()
+wav2vec_processor = AutoProcessor.from_pretrained(wav2vec_path)
+wav2vec_model = Wav2Vec2ForSequenceClassification.from_pretrained(wav2vec_path).to(device).eval()
+
+# === Function: Extract Combined Embedding ===
+def extract_combined_embedding(audio_path):
+    waveform, sr = torchaudio.load(audio_path)
+    if sr != 16000:
+        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+    waveform = waveform.squeeze()
+    waveform = waveform / waveform.abs().max()
+
+    # Whisper
+    inputs = whisper_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
+    with torch.no_grad():
+        output = whisper_model(**inputs, decoder_input_ids=torch.zeros((1, 1), dtype=torch.long).to(device), output_hidden_states=True)
+    whisper_emb = output.encoder_hidden_states[-2].mean(dim=1).squeeze().cpu().numpy()
+
+    # ECAPA
+    with torch.no_grad():
+        ecapa_emb = ecapa_model.encode_batch(waveform.unsqueeze(0)).squeeze().cpu().numpy()
+
+    # Normalize and concatenate
+    whisper_emb /= np.linalg.norm(whisper_emb)
+    ecapa_emb /= np.linalg.norm(ecapa_emb)
+    return np.concatenate((whisper_emb, ecapa_emb))
+
+# === Function: Predict Degradation Level ===
+def predict_degradation(audio_path):
+    waveform, sr = torchaudio.load(audio_path)
+    if sr != 16000:
+        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+    waveform = waveform.squeeze()
+    inputs = wav2vec_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt", padding=True).to(device)
+    with torch.no_grad():
+        logits = wav2vec_model(**inputs).logits
+        predicted = torch.argmax(logits, dim=-1).item()
+    return predicted  # 0 = low, 1 = medium, 2 = high
+
+# === Function: Threshold Mapping ===
+def get_adaptive_threshold(level):
+    if level == 0:
+        return 0.64
+    elif level == 1:
+        return 0.70
+    else:
+        return 0.75
+
+# === Function: Load Reference Embeddings ===
+def load_reference_embeddings(path):
+    refs = []
+    for speaker in os.listdir(path):
+        spk_path = os.path.join(path, speaker)
+        if os.path.isdir(spk_path):
+            for file in os.listdir(spk_path):
+                if file.endswith(".npy"):
+                    emb = np.load(os.path.join(spk_path, file))
+                    emb /= np.linalg.norm(emb)
+                    refs.append((speaker.lower(), emb))
+    return refs
+
+# === Function: Compute Baseline Similarities ===
+def compute_baseline_sims(clean_dir, reference_embeddings):
+    sims = {}
+    for speaker in os.listdir(clean_dir):
+        spk_path = os.path.join(clean_dir, speaker)
+        if not os.path.isdir(spk_path): continue
+        wavs = [f for f in os.listdir(spk_path) if f.endswith(".wav")]
+        if not wavs: continue
+        test_emb = extract_combined_embedding(os.path.join(spk_path, wavs[0]))
+        max_sim = max(cosine_similarity([test_emb], [ref])[0][0]
+                      for ref_spk, ref in reference_embeddings if ref_spk == speaker.lower())
+        sims[speaker.lower()] = max_sim
+    return sims
+
+# === Function: Drift-Based Security Decision ===
+def security_decision(baseline, current):
+    deviation = abs(current - baseline)
+    if deviation < 0.02:
+        return deviation, "No Drift", "✅ Accept"
+    elif deviation < 0.04:
+        return deviation, "Mild Drift", "🟠 Liveness Challenge"
+    else:
+        return deviation, "High Drift", "🔴 MFA / Reject"
+
+# === Unified Pipeline Execution ===
+print("🚀 Extracting test embedding...")
+test_embedding = extract_combined_embedding(test_audio_path)
+
+print("📉 Predicting degradation...")
+predicted_level = predict_degradation(test_audio_path)
+threshold = get_adaptive_threshold(predicted_level)
+
+print("🧠 Loading reference embeddings...")
+reference_embeddings = load_reference_embeddings(reference_embeddings_dir)
+
+print("📊 Calculating baseline similarities...")
+baseline_sims = compute_baseline_sims(baseline_clean_audio_dir, reference_embeddings)
+
+# === Match Test Audio ===
+similarities = [(speaker, cosine_similarity([test_embedding], [ref])[0][0]) for speaker, ref in reference_embeddings]
+similarities.sort(key=lambda x: x[1], reverse=True)
+matched_speaker, top_score = similarities[0]
+
+# === Drift Detection & Policy ===
+if matched_speaker in baseline_sims:
+    deviation, drift_status, action = security_decision(baseline_sims[matched_speaker], top_score)
+else:
+    deviation, drift_status, action = None, "Unknown", "⚠️ No Baseline"
+
+# === Output ===
+print("\n📝 FINAL RESULT")
+print(f"Test File:              {os.path.basename(test_audio_path)}")
+print(f"Matched Speaker:        {matched_speaker}")
+print(f"Similarity Score:       {top_score:.4f}")
+print(f"Predicted Degradation:  {predicted_level}")
+print(f"Adaptive Threshold:     {threshold}")
+print(f"Deviation from Baseline:{'%.4f' % deviation if deviation else 'N/A'}")
+print(f"Drift Status:           {drift_status}")
+print(f"Security Decision:      {action}")
