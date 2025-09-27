@@ -1,0 +1,32 @@
+#Adaptive Policy Refinement and Security Violation Detection
+
+import pandas as pd
+
+# Step 1: Load the adaptive results with drift and action
+adaptive_csv = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/drift_detection_results.csv"
+df = pd.read_csv(adaptive_csv)
+
+# Step 2: Define the correct policy mapping
+policy_mapping = {
+    "No Drift": "✅ Accept",
+    "Mild Drift": "🟠 Prompt Repeat (Active Challenge)",
+    "High Drift": "🔴 MFA (High Drift Immediate)"
+}
+
+# Step 3: Check for violations where the action does NOT match the policy
+df["ExpectedAction"] = df["DriftStatus"].map(policy_mapping)
+df["PolicyViolation"] = df["SecurityAction"] != df["ExpectedAction"]
+
+# Count and summarize violations
+violation_summary = df[df["PolicyViolation"]].groupby(["DriftStatus", "SecurityAction"]).size().reset_index(name="ViolationCount")
+
+# Save violation report
+violation_csv = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/policy_violation_log.csv"
+violation_summary.to_csv(violation_csv, index=False)
+
+print("✅ Policy violation report saved to:")
+print(violation_csv)
+
+# Optional: Print sample violations
+print("\n🔍 Sample Violations:")
+print(df[df["PolicyViolation"]].head(5))
