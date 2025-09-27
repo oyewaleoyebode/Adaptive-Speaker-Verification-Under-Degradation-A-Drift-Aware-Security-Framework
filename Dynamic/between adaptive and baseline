@@ -1,0 +1,58 @@
+#between adaptive and baseline 
+
+import pandas as pd
+
+# === Paths ===
+baseline_csv = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/baseline_mode_results.csv"
+adaptive_csv = "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/drift_detection_results.csv"
+
+# === Load CSVs ===
+df_baseline = pd.read_csv(baseline_csv)
+df_adaptive = pd.read_csv(adaptive_csv)
+
+print("✅ Loaded Baseline and Adaptive results.")
+
+# === Baseline Summary ===
+baseline_summary = df_baseline['Decision'].value_counts().reset_index()
+baseline_summary.columns = ['Decision', 'Count']
+baseline_summary['Percent'] = 100 * baseline_summary['Count'] / baseline_summary['Count'].sum()
+
+print("\n=== Baseline Mode Summary ===")
+print(baseline_summary)
+
+# === Baseline Metrics ===
+TP = len(df_baseline[df_baseline["Decision"] == "Correct Verification"])
+FP = len(df_baseline[df_baseline["Decision"] == "Wrongly Accepted"])
+FN = len(df_baseline[(df_baseline["Decision"] == "Rejected") & (df_baseline["PredictedSpeaker"] == df_baseline["TrueSpeaker"])])
+TN = len(df_baseline[(df_baseline["Decision"] == "Rejected") & (df_baseline["PredictedSpeaker"] != df_baseline["TrueSpeaker"])])
+
+baseline_total = TP + FP + FN + TN
+baseline_accuracy = 100 * (TP + TN) / baseline_total if baseline_total else 0
+baseline_far = 100 * FP / (FP + TN) if (FP + TN) else 0
+baseline_frr = 100 * FN / (FN + TP) if (FN + TP) else 0
+
+print("\n=== Baseline Metrics ===")
+print(f"Accuracy: {baseline_accuracy:.2f}%")
+print(f"FAR (False Accept Rate): {baseline_far:.2f}%")
+print(f"FRR (False Reject Rate): {baseline_frr:.2f}%")
+
+# === Adaptive Summary ===
+adaptive_summary = df_adaptive.groupby(["DriftStatus", "SecurityAction"]).size().reset_index(name="Count")
+total_per_drift = df_adaptive.groupby("DriftStatus").size().reset_index(name="Total")
+adaptive_summary = adaptive_summary.merge(total_per_drift, on="DriftStatus")
+adaptive_summary["Percent"] = 100 * adaptive_summary["Count"] / adaptive_summary["Total"]
+
+print("\n=== Adaptive Mode: Drift vs. Security Action Breakdown ===")
+print(adaptive_summary)
+
+# === Pivot Table ===
+pivot = adaptive_summary.pivot_table(index="DriftStatus", columns="SecurityAction", values="Percent", fill_value=0)
+print("\n=== Adaptive Mode Pivot (% Actions per Drift Status) ===")
+print(pivot)
+
+# === Save All Outputs ===
+baseline_summary.to_csv("/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/baseline_summary.csv", index=False)
+adaptive_summary.to_csv("/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/adaptive_summary.csv", index=False)
+pivot.to_csv("/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/adaptive_pivot.csv")
+
+print("\n✅ All summaries and metrics saved!")
