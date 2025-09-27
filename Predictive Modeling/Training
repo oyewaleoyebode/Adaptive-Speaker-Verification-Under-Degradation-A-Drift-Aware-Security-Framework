@@ -1,0 +1,86 @@
+#TRANING WAV2VEC PREDICITON
+
+%pip install datasets transformers torchaudio 
+%pip install transformers==4.36.2 accelerate==0.25.0 datasets torchaudio --upgrade 
+
+# 🔧 Imports
+import os
+import torch
+import torchaudio
+import numpy as np
+from datasets import Dataset
+from transformers import (
+    Wav2Vec2Processor,
+    Wav2Vec2ForSequenceClassification,
+    TrainingArguments,
+    Trainer
+)
+
+# ✅ STEP 1: Load and Label Audio Data (using your paths)
+degradation_levels = {
+    "Baseline": "/work/oluwatobi-o/VOICE_DEGRADATION/16kh_Converted_VoiceInput copy",
+    "Level 2": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_2_Output_fixed",
+    "Level 3": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_3_Output_fixed_WAV",
+    "Level 4": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_4_Output_WAV",
+    "Level 5": "/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio/Level_5_Output_WAV"
+}
+
+audio_data, labels = [], []
+
+for idx, (_, folder) in enumerate(degradation_levels.items()):
+    for speaker in os.listdir(folder):
+        spk_path = os.path.join(folder, speaker)
+        if not os.path.isdir(spk_path): continue
+        for file in os.listdir(spk_path):
+            if file.endswith(".wav"):
+                wav_path = os.path.join(spk_path, file)
+                waveform, sr = torchaudio.load(wav_path)
+                if sr != 16000:
+                    waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+                audio_data.append({"array": waveform.squeeze().numpy(), "sampling_rate": 16000})
+                labels.append(idx)
+                break  # Use only 1 file per speaker
+
+dataset = Dataset.from_dict({"audio": audio_data, "label": labels})
+
+# ✅ STEP 2: Preprocess with Wav2Vec2 Processor
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base")
+
+def preprocess(example):
+    processed = processor(example["audio"]["array"], sampling_rate=16000, return_tensors="pt")
+    return {"input_values": processed.input_values[0], "labels": example["label"]}
+
+dataset = dataset.map(preprocess)
+
+# ✅ STEP 3: Fine-tune Wav2Vec2 for Classification
+model = Wav2Vec2ForSequenceClassification.from_pretrained(
+    "facebook/wav2vec2-base",
+    num_labels=5,
+    problem_type="single_label_classification"
+)
+
+training_args = TrainingArguments(
+    output_dir="./wav2vec2_degradation_predictor",
+    per_device_train_batch_size=4,
+    evaluation_strategy="epoch",
+    num_train_epochs=3,
+    save_strategy="epoch",
+    logging_dir="./logs",
+    load_best_model_at_end=True
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset.train_test_split(test_size=0.2)["train"],
+    eval_dataset=dataset.train_test_split(test_size=0.2)["test"],
+    tokenizer=processor
+)
+
+trainer.train()
+
+# ✅ STEP 4: Save the Model
+trainer.save_model("/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio//wav2vec2_degradation_predictor")
+processor.save_pretrained("/work/oluwatobi-o/VOICE_DEGRADATION/Degradation_Levels_Audio//wav2vec2_degradation_predictor")
+
+print("✅ Fine-tuning complete. Model saved to './wav2vec2_degradation_predictor'")
